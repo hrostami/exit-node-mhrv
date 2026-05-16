@@ -38,7 +38,7 @@
 // other sites are unaffected.
 
 const PSK = Deno.env.get("EXIT_NODE_PSK") || "CHANGE_ME_TO_A_STRONG_SECRE";
-console.log(`PSK Loaded: ${PSK.substring(0,4)...}`);
+console.log(`PSK Loaded: ${PSK.substring(0,4)}...`);
 
 // Headers the client may send that must NOT be forwarded to the
 // destination — they're hop-by-hop or would break re-encoding.
