@@ -36,16 +36,16 @@
 // the regular Apps Script relay automatically — the only consequence
 // of an offline exit node is that ChatGPT/Claude/Grok stop working;
 // other sites are unaffected.
-
+declare const Deno: any;
 const PSK = Deno.env.get("EXIT_NODE_PSK") || "CHANGE_ME_TO_A_STRONG_SECRE";
 console.log(`PSK Loaded: ${PSK.substring(0,4)}...`);
 
-// Headers the client may send that must NOT be forwarded to the
-// destination — they're hop-by-hop or would break re-encoding.
 const STRIP_HEADERS = new Set([
   "host",
   "connection",
   "content-length",
+  // Deno passes compressed response bytes through. Ask origins for plain bodies.
+  "accept-encoding",
   "transfer-encoding",
   "proxy-connection",
   "proxy-authorization",
@@ -82,20 +82,7 @@ function sanitizeHeaders(h: unknown): Record<string, string> {
   return out;
 }
 
-export async function handleExitNodeRequest(req: Request): Promise<Response> {
-  // Fail closed on the placeholder PSK so a fresh deploy without setup
-  // can't accidentally serve as an open relay.
-  if (PSK === "CHANGE_ME_TO_A_STRONG_SECRET") {
-    return Response.json(
-      {
-        e:
-          "exit_node misconfigured: PSK is still the placeholder. Set " +
-          "a strong secret in the source before deploying.",
-      },
-      { status: 503 },
-    );
-  }
-
+Deno.serve(async (req: Request): Promise<Response> => {
   try {
     if (req.method !== "POST") {
       return Response.json({ e: "method_not_allowed" }, { status: 405 });
@@ -106,58 +93,33 @@ export async function handleExitNodeRequest(req: Request): Promise<Response> {
       return Response.json({ e: "bad_json" }, { status: 400 });
     }
 
+    if (!PSK) {
+      return Response.json({ e: "server_psk_missing" }, { status: 500 });
+    }
+
     const k = String((body as any).k ?? "");
     const u = String((body as any).u ?? "");
     const m = String((body as any).m ?? "GET").toUpperCase();
     const h = sanitizeHeaders((body as any).h);
     const b64 = (body as any).b;
 
-    if (k !== PSK) {
-      return Response.json({ e: "unauthorized" }, { status: 401 });
-    }
-    if (!/^https?:\/\//i.test(u)) {
-      return Response.json({ e: "bad url" }, { status: 400 });
-    }
-
-    // Loop guard: if u points at this exit node's own host, refuse.
-    // Without this, a misconfigured client could chain exit-node →
-    // exit-node → exit-node → ... and burn the host's runtime budget.
-    try {
-      const reqUrl = new URL(req.url);
-      const dstUrl = new URL(u);
-      if (reqUrl.host === dstUrl.host && reqUrl.protocol === dstUrl.protocol) {
-        return Response.json({ e: "exit-node loop refused" }, { status: 400 });
-      }
-    } catch {
-      // Malformed URL — let the fetch below 400.
-    }
+    if (k !== PSK) return Response.json({ e: "unauthorized" }, { status: 401 });
+    if (!/^https?:\/\//i.test(u)) return Response.json({ e: "bad_url" }, { status: 400 });
 
     let payload: Uint8Array | undefined;
-    if (typeof b64 === "string" && b64.length > 0) {
-      payload = decodeBase64ToBytes(b64);
-    }
+    if (typeof b64 === "string" && b64.length > 0) payload = decodeBase64ToBytes(b64);
+    const requestBody = payload ? Uint8Array.from(payload) : undefined;
 
     const resp = await fetch(u, {
       method: m,
       headers: h,
-      body: payload,
+      body: requestBody as unknown as BodyInit,
       redirect: "manual",
     });
 
-    // `fetch()` (Deno / Bun / Node) auto-decompresses gzip / br / deflate
-    // responses, so `resp.arrayBuffer()` returns plain bytes — but the
-    // destination's `Content-Encoding` header is still on `resp.headers`.
-    // Forwarding it would tell the client browser "this body is gzipped"
-    // when it isn't, producing `Content Encoding Error` (#964). Same goes
-    // for `Content-Length` — the post-decompression byte count is
-    // different from what the destination announced. Strip both. The
-    // Apps Script + Rust transport layer below us re-frames the wire body
-    // anyway, so neither header is meaningful to forward.
     const data = new Uint8Array(await resp.arrayBuffer());
     const respHeaders: Record<string, string> = {};
     resp.headers.forEach((value, key) => {
-      const lower = key.toLowerCase();
-      if (lower === "content-encoding" || lower === "content-length") return;
       respHeaders[key] = value;
     });
 
@@ -170,8 +132,4 @@ export async function handleExitNodeRequest(req: Request): Promise<Response> {
     const message = err instanceof Error ? err.message : String(err);
     return Response.json({ e: message }, { status: 500 });
   }
-}
-
-export default {
-  fetch: handleExitNodeRequest,
-};
+});
